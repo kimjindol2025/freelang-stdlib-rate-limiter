@@ -1,0 +1,469 @@
+/**
+ * FreeLang Rate Limiter
+ *
+ * rate-limiter-flexible npm 패키지의 FreeLang stdlib 구현
+ * IP/사용자별 요청 횟수 제한, HTTP 429 자동 처리
+ *
+ * 사용법:
+ *   let limiter = ipRateLimiter(100, 60)
+ *   app.use(limiter)
+ *
+ *   let loginLimiter = rateLimiterMiddleware({
+ *     points: 5,
+ *     duration: 60,
+ *     blockDuration: 300
+ *   })
+ *   app.post("/login", loginLimiter, loginHandler)
+ */
+
+import { Request, Response, Middleware, setStatus, setHeader, respondJson } from "./express-compat"
+
+// ============================================
+// 설정 구조체
+// ============================================
+
+struct RateLimiterConfig {
+  points: int,          // 허용 요청 수 (포인트)
+  duration: int,        // 기간 (초)
+  blockDuration: int,   // 제한 초과 시 차단 시간 (초)
+  keyPrefix: string,    // 저장 키 접두사
+  storeType: string     // 저장소 타입: "memory" | "redis"
+}
+
+// ============================================
+// 요청 제한 결과
+// ============================================
+
+struct RateLimiterResult {
+  allowed: bool,            // 요청 허용 여부
+  remainingPoints: int,     // 남은 포인트
+  msBeforeNext: int,        // 다음 요청까지 대기 ms (차단 시)
+  consumedPoints: int,      // 소비된 총 포인트
+  isBlocked: bool,          // 현재 차단 상태 여부
+  blockExpires: int         // 차단 만료 Unix timestamp (0 = 차단 없음)
+}
+
+// ============================================
+// 메모리 저장소
+// data 맵의 각 엔트리 구조:
+//   { points: int, resetAt: int, blockedUntil: int }
+// ============================================
+
+struct RateLimiterStore {
+  data: map,                  // key → { points, resetAt, blockedUntil }
+  config: RateLimiterConfig
+}
+
+// ============================================
+// 기본 설정값 헬퍼
+// ============================================
+
+fn defaultConfig(points: int, duration: int) -> RateLimiterConfig {
+  return {
+    points: points,
+    duration: duration,
+    blockDuration: 0,
+    keyPrefix: "rl",
+    storeType: "memory"
+  }
+}
+
+// ============================================
+// Rate Limiter 생성
+// ============================================
+
+fn createRateLimiter(config: RateLimiterConfig) -> RateLimiterStore {
+  return {
+    data: {},
+    config: config
+  }
+}
+
+// ============================================
+// 내부 헬퍼: 저장소 키 생성
+// ============================================
+
+fn _makeKey(config: RateLimiterConfig, key: string) -> string {
+  return config.keyPrefix + ":" + key
+}
+
+// ============================================
+// 내부 헬퍼: 엔트리 초기화 또는 조회
+// ============================================
+
+fn _getOrCreateEntry(store: RateLimiterStore, storeKey: string) -> map {
+  let now = os.time()
+  let entry = store.data[storeKey]
+
+  if entry == null {
+    // 새 엔트리 생성
+    return {
+      points: 0,
+      resetAt: now + store.config.duration,
+      blockedUntil: 0
+    }
+  }
+
+  // 기간 만료 시 초기화
+  if entry.resetAt <= now && entry.blockedUntil <= now {
+    return {
+      points: 0,
+      resetAt: now + store.config.duration,
+      blockedUntil: 0
+    }
+  }
+
+  return entry
+}
+
+// ============================================
+// consume: 포인트 소비 (요청 처리의 핵심)
+// ============================================
+
+fn consume(store: RateLimiterStore, key: string) -> RateLimiterResult {
+  let now = os.time()
+  let storeKey = _makeKey(store.config, key)
+  let entry = _getOrCreateEntry(store, storeKey)
+
+  // 차단 상태 확인
+  if entry.blockedUntil > now {
+    let msLeft = (entry.blockedUntil - now) * 1000
+    store.data[storeKey] = entry
+    return {
+      allowed: false,
+      remainingPoints: 0,
+      msBeforeNext: msLeft,
+      consumedPoints: entry.points,
+      isBlocked: true,
+      blockExpires: entry.blockedUntil
+    }
+  }
+
+  // 포인트 소비
+  entry.points = entry.points + 1
+  store.data[storeKey] = entry
+
+  // 제한 초과 확인
+  if entry.points > store.config.points {
+    // blockDuration이 설정된 경우 차단 적용
+    if store.config.blockDuration > 0 {
+      entry.blockedUntil = now + store.config.blockDuration
+      store.data[storeKey] = entry
+      let msLeft = store.config.blockDuration * 1000
+      return {
+        allowed: false,
+        remainingPoints: 0,
+        msBeforeNext: msLeft,
+        consumedPoints: entry.points,
+        isBlocked: true,
+        blockExpires: entry.blockedUntil
+      }
+    }
+
+    // blockDuration 없으면 기간 만료까지 대기
+    let msLeft = (entry.resetAt - now) * 1000
+    if msLeft < 0 {
+      msLeft = 0
+    }
+    return {
+      allowed: false,
+      remainingPoints: 0,
+      msBeforeNext: msLeft,
+      consumedPoints: entry.points,
+      isBlocked: false,
+      blockExpires: 0
+    }
+  }
+
+  // 허용
+  let remaining = store.config.points - entry.points
+  return {
+    allowed: true,
+    remainingPoints: remaining,
+    msBeforeNext: 0,
+    consumedPoints: entry.points,
+    isBlocked: false,
+    blockExpires: 0
+  }
+}
+
+// ============================================
+// get: 현재 상태 조회 (포인트 소비 없음)
+// ============================================
+
+fn get(store: RateLimiterStore, key: string) -> RateLimiterResult {
+  let now = os.time()
+  let storeKey = _makeKey(store.config, key)
+  let entry = store.data[storeKey]
+
+  if entry == null {
+    return {
+      allowed: true,
+      remainingPoints: store.config.points,
+      msBeforeNext: 0,
+      consumedPoints: 0,
+      isBlocked: false,
+      blockExpires: 0
+    }
+  }
+
+  // 기간 만료 확인
+  if entry.resetAt <= now && entry.blockedUntil <= now {
+    return {
+      allowed: true,
+      remainingPoints: store.config.points,
+      msBeforeNext: 0,
+      consumedPoints: 0,
+      isBlocked: false,
+      blockExpires: 0
+    }
+  }
+
+  // 차단 상태
+  if entry.blockedUntil > now {
+    let msLeft = (entry.blockedUntil - now) * 1000
+    return {
+      allowed: false,
+      remainingPoints: 0,
+      msBeforeNext: msLeft,
+      consumedPoints: entry.points,
+      isBlocked: true,
+      blockExpires: entry.blockedUntil
+    }
+  }
+
+  let remaining = store.config.points - entry.points
+  if remaining < 0 {
+    remaining = 0
+  }
+  let allowed = entry.points <= store.config.points
+  return {
+    allowed: allowed,
+    remainingPoints: remaining,
+    msBeforeNext: 0,
+    consumedPoints: entry.points,
+    isBlocked: false,
+    blockExpires: 0
+  }
+}
+
+// ============================================
+// reset: 특정 키의 제한 초기화
+// ============================================
+
+fn reset(store: RateLimiterStore, key: string) -> void {
+  let storeKey = _makeKey(store.config, key)
+  delete(store.data, storeKey)
+}
+
+// ============================================
+// block: 특정 키를 수동으로 차단
+// ============================================
+
+fn block(store: RateLimiterStore, key: string, duration: int) -> void {
+  let now = os.time()
+  let storeKey = _makeKey(store.config, key)
+  let entry = _getOrCreateEntry(store, storeKey)
+  entry.blockedUntil = now + duration
+  store.data[storeKey] = entry
+}
+
+// ============================================
+// cleanup: 만료된 엔트리 정리
+// ============================================
+
+fn cleanup(store: RateLimiterStore) -> int {
+  let now = os.time()
+  let keys = map.keys(store.data)
+  let removed = 0
+  let i = 0
+
+  while i < arr.length(keys) {
+    let k = keys[i]
+    let entry = store.data[k]
+    if entry.resetAt <= now && entry.blockedUntil <= now {
+      delete(store.data, k)
+      removed = removed + 1
+    }
+    i = i + 1
+  }
+
+  return removed
+}
+
+// ============================================
+// 내부 헬퍼: Rate Limit 응답 헤더 추가
+// ============================================
+
+fn _setRateLimitHeaders(res: Response, config: RateLimiterConfig, result: RateLimiterResult) -> void {
+  setHeader(res, "X-RateLimit-Limit", str(config.points))
+  setHeader(res, "X-RateLimit-Remaining", str(result.remainingPoints))
+  setHeader(res, "X-RateLimit-Reset", str(result.blockExpires))
+
+  if !result.allowed {
+    let retryAfterSec = result.msBeforeNext / 1000
+    setHeader(res, "Retry-After", str(retryAfterSec))
+  }
+}
+
+// ============================================
+// rateLimiterMiddleware: 설정 기반 미들웨어 (IP 키 기본)
+// ============================================
+
+fn rateLimiterMiddleware(config: RateLimiterConfig) -> Middleware {
+  let store = createRateLimiter(config)
+
+  return fn(req: Request, res: Response) -> bool {
+    let key = req.ip
+    if key == null || key == "" {
+      key = "unknown"
+    }
+
+    let result = consume(store, key)
+    _setRateLimitHeaders(res, config, result)
+
+    if !result.allowed {
+      setStatus(res, 429)
+      respondJson(res, {
+        error: "Too Many Requests",
+        message: "요청 한도를 초과했습니다. 잠시 후 다시 시도해 주세요.",
+        retryAfter: result.msBeforeNext / 1000
+      })
+      return false
+    }
+
+    return true
+  }
+}
+
+// ============================================
+// userRateLimiterMiddleware: 사용자 ID 키 기반 미들웨어
+// ============================================
+
+fn userRateLimiterMiddleware(config: RateLimiterConfig) -> Middleware {
+  let store = createRateLimiter(config)
+
+  return fn(req: Request, res: Response) -> bool {
+    // req.userId가 없으면 IP로 폴백
+    let key = req.params["userId"]
+    if key == null || key == "" {
+      key = req.ip
+    }
+    if key == null || key == "" {
+      key = "anonymous"
+    }
+
+    let result = consume(store, key)
+    _setRateLimitHeaders(res, config, result)
+
+    if !result.allowed {
+      setStatus(res, 429)
+      respondJson(res, {
+        error: "Too Many Requests",
+        message: "사용자 요청 한도를 초과했습니다. 잠시 후 다시 시도해 주세요.",
+        retryAfter: result.msBeforeNext / 1000
+      })
+      return false
+    }
+
+    return true
+  }
+}
+
+// ============================================
+// ipRateLimiter: IP 기준 편의 함수
+// ============================================
+
+fn ipRateLimiter(points: int, duration: int) -> Middleware {
+  let config: RateLimiterConfig = {
+    points: points,
+    duration: duration,
+    blockDuration: 0,
+    keyPrefix: "ip",
+    storeType: "memory"
+  }
+  return rateLimiterMiddleware(config)
+}
+
+// ============================================
+// userRateLimiter: 사용자 기준 편의 함수
+// ============================================
+
+fn userRateLimiter(points: int, duration: int) -> Middleware {
+  let config: RateLimiterConfig = {
+    points: points,
+    duration: duration,
+    blockDuration: 0,
+    keyPrefix: "user",
+    storeType: "memory"
+  }
+  return userRateLimiterMiddleware(config)
+}
+
+// ============================================
+// getStats: 저장소 현황 통계
+// ============================================
+
+fn getStats(store: RateLimiterStore) -> map {
+  let now = os.time()
+  let keys = map.keys(store.data)
+  let totalKeys = arr.length(keys)
+  let activeKeys = 0
+  let blockedKeys = 0
+  let expiredKeys = 0
+
+  let i = 0
+  while i < totalKeys {
+    let k = keys[i]
+    let entry = store.data[k]
+
+    if entry.blockedUntil > now {
+      blockedKeys = blockedKeys + 1
+    } else if entry.resetAt > now {
+      activeKeys = activeKeys + 1
+    } else {
+      expiredKeys = expiredKeys + 1
+    }
+
+    i = i + 1
+  }
+
+  return {
+    totalKeys: totalKeys,
+    activeKeys: activeKeys,
+    blockedKeys: blockedKeys,
+    expiredKeys: expiredKeys,
+    config: {
+      points: store.config.points,
+      duration: store.config.duration,
+      blockDuration: store.config.blockDuration,
+      storeType: store.config.storeType
+    }
+  }
+}
+
+// ============================================
+// Export
+// ============================================
+
+export {
+  // 구조체
+  RateLimiterConfig,
+  RateLimiterResult,
+  RateLimiterStore,
+
+  // 핵심 함수
+  createRateLimiter,
+  consume,
+  get,
+  reset,
+  block,
+  cleanup,
+  getStats,
+
+  // 미들웨어
+  rateLimiterMiddleware,
+  userRateLimiterMiddleware,
+  ipRateLimiter,
+  userRateLimiter
+}
